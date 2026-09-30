@@ -63,6 +63,60 @@ unsigned int phy_loopback(ETH_TX_FRAME* Frame, ETH_RX_FRAME* rx_Frame,
 	return phy_failed;
 }
 
+
+/* ------------------------------------------------------------------------------------------
+ * Bring the Ethernet MAC + DMA back to a known-good state before every test case.
+ *
+ * Why this exists: previously nothing was reset between tests, so
+ *   (a) STATUS flags (UNF/TPS/TU/RU/RPS...) from one failed test stayed set, and the TX DMA
+ *       was left stuck in "waiting for status" (STATUS.TS = 2) - every later test then timed
+ *       out with the same STATUS value, and
+ *   (b) MAC_CONFIGURATION.FES / DM / LM were changed while TE and RE (transmitter/receiver)
+ *       were still enabled. Changing speed/duplex on a running MAC glitches the TX path and
+ *       gives a TX underflow, which is what happened as soon as a 100 Mbps test ran.
+ * A software reset (BUS_MODE.SWR) clears the DMA/MTL/MAC state machines and all registers, so
+ * we reset, apply speed/duplex/loopback with TE/RE off, and only then re-enable TX/RX.
+ * Returns true on success, false if the reset never completed (no RMII REF_CLK).
+ * ---------------------------------------------------------------------------------------- */
+static bool eth_test_reset_and_configure(bool mac_loopback, uint8_t speed_100m, uint8_t full_duplex)
+{
+    /* 1. Stop everything that is running. */
+    bits_clear(ETH0_REG_MAC_CONFIGURATION_ADDR, ETH_MAC_CONFIGURATION_TE_Pos, ETH_MAC_CONFIGURATION_TE_Msk);
+    bits_clear(ETH0_REG_MAC_CONFIGURATION_ADDR, ETH_MAC_CONFIGURATION_RE_Pos, ETH_MAC_CONFIGURATION_RE_Msk);
+    tx_dma_stop();
+    rx_dma_stop();
+
+    /* 2. Software reset of the whole ETH core. SWR only clears when the RMII clock is present. */
+    mac_soft_reset_start();
+    uint32_t timeout = 1000000u;
+    while (bit_get(ETH0_REG_BUS_MODE_ADDR, ETH_BUS_MODE_SWR_Pos) && --timeout) {
+        __NOP();
+    }
+    if (timeout == 0u) {
+        printf("[DEBUG] MAC software reset did not complete (no RMII REF_CLK?)\r\n");
+        return false;
+    }
+
+    /* 3. Clear any stale STATUS flags (write-1-to-clear). */
+    bits_clear_w1c(ETH0_REG_STATUS_ADDR, 0xFFFFFFFFu);
+
+    /* 4. Re-apply the setup main() does once at boot, since SWR put registers back to defaults. */
+    mdio_set_clock(72);
+    bits_set(ETH0_REG_MAC_CONFIGURATION_ADDR, 7, 0x80);
+
+    /* 5. Speed / duplex / loopback while TE and RE are still OFF. */
+    if (mac_loopback) {
+        mac_loopback_enable();
+    } else {
+        mac_loopback_disable();
+    }
+    mac_apply_config(speed_100m ? 'h' : 'l', full_duplex ? 'f' : 'h', 'n');
+
+    /* 6. Now enable the DMA bus config and interrupts; this also sets TE and RE. */
+    eth_configure_dma_bus('r', 'r', 3, 0x0);
+    return true;
+}
+
 bool ETH_RunTestCase(eth_test_id_t test_id,
                      ETH_TX_FRAME* Frame,
                      ETH_RX_FRAME* rx_Frame,
@@ -95,16 +149,18 @@ bool ETH_RunTestCase(eth_test_id_t test_id,
     memset(tx_desc_list, 0, sizeof(ETH_TX_DESC) * 4);
     memset(rx_desc_list, 0, sizeof(ETH_RX_DESC) * 4);
 
-    /* 1. Configure PHY (BMCR: loopback / speed / duplex, auto-negotiation off) */
-    ETH_PHY_ConfigureMode(PHY_ADDR, is_phy_lb, speed_100m, full_duplex);
-
-    /* 2. Configure MAC (LM loopback bit, speed, duplex, MAC addresses, frame size) */
-    if (is_mac_lb) {
-        mac_loopback_enable();
-    } else {
-        mac_loopback_disable();
+    /* 1. Reset the MAC/DMA and apply speed, duplex and MAC-loopback with TX/RX disabled. */
+    if (!eth_test_reset_and_configure(is_mac_lb, speed_100m, full_duplex)) {
+        return false;
     }
-    mac_apply_config(speed_100m ? 'h' : 'l', full_duplex ? 'f' : 'h', 'n');
+
+    /* 2. PHY: only PHY-loopback tests touch the PHY's speed/duplex. MAC tests just make sure
+     *    the PHY is not left in loopback from an earlier PHY test. */
+    if (is_phy_lb) {
+        ETH_PHY_ConfigureMode(PHY_ADDR, true, speed_100m, full_duplex);
+    } else {
+        phy_disable_loopback(PHY_ADDR);
+    }
 
     /* Let the PHY / clocks settle before the first frame. */
     for (volatile uint32_t d = 0; d < 150000u; d++) {
@@ -130,7 +186,7 @@ bool ETH_RunTestCase(eth_test_id_t test_id,
 
     /* 5. Wait for TX and RX to complete (both are bounded, so this cannot hang). */
     if (!wait_for_transmit_complete()) {
-        printf("[DEBUG] Timeout: transmit did not complete\r\n");
+        printf("[DEBUG] Timeout: transmit did not complete, STATUS=0x%08X\r\n", (unsigned int)reg32_read(ETH0_REG_STATUS_ADDR));
         return false;
     }
     if (!wait_for_receive_complete()) {
