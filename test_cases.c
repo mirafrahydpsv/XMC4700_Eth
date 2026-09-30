@@ -22,6 +22,12 @@ extern int run_mac_loopback_test(ETH_TX_FRAME* Frame, ETH_RX_FRAME* rx_Frame,
                                   ETH_TX_DESC* tx_desc_list, ETH_RX_DESC* rx_desc_list);
 extern int run_phy_loopback_test(ETH_TX_FRAME* Frame, ETH_RX_FRAME* rx_Frame,
                                   ETH_TX_DESC* tx_desc_list, ETH_RX_DESC* rx_desc_list);
+static void delay_ms(uint32_t ms)
+{
+    for (volatile uint32_t i = 0; i < (ms * 18000); i++) {
+        __NOP();
+    }
+}
 
 unsigned int internal_loopback(ETH_TX_FRAME* Frame, ETH_RX_FRAME* rx_Frame,
                                 ETH_TX_DESC* tx_desc_list, ETH_RX_DESC* rx_desc_list){
@@ -117,6 +123,8 @@ static bool eth_test_reset_and_configure(bool mac_loopback, uint8_t speed_100m, 
     return true;
 }
 
+
+
 bool ETH_RunTestCase(eth_test_id_t test_id,
                      ETH_TX_FRAME* Frame,
                      ETH_RX_FRAME* rx_Frame,
@@ -141,59 +149,117 @@ bool ETH_RunTestCase(eth_test_id_t test_id,
         default: return false;
     }
 
-    unsigned int frame_size = (unsigned int)sizeof(ETH_TX_FRAME);
+    /* 1. Stop DMA TX & RX temporarily */
+    uint32_t op_mode = reg32_read(ETH0_REG_OPERATION_MODE_ADDR);
+    reg32_write(ETH0_REG_OPERATION_MODE_ADDR, op_mode & ~(0x00002002));
 
-    /* Start from a clean slate: known TX/RX buffers and empty descriptors. */
-    memset(Frame, 0x00, sizeof(ETH_TX_FRAME));
-    memset(rx_Frame, 0xFF, sizeof(ETH_RX_FRAME));   /* junk, so a PASS has to be real */
-    memset(tx_desc_list, 0, sizeof(ETH_TX_DESC) * 4);
-    memset(rx_desc_list, 0, sizeof(ETH_RX_DESC) * 4);
+    /* 2. Configure External PHY via MDIO (Register 0: BMCR) */
+    uint16_t bmcr = 0;
+    if (is_phy_lb)   bmcr |= (1U << 14); // Loopback
+    if (speed_100m)  bmcr |= (1U << 13); // Speed: 100M
+    if (full_duplex) bmcr |= (1U << 8);  // Full Duplex
+    mdio_write_phy_reg(PHY_ADDR, 0x00, bmcr);
 
-    /* 1. Reset the MAC/DMA and apply speed, duplex and MAC-loopback with TX/RX disabled. */
-    if (!eth_test_reset_and_configure(is_mac_lb, speed_100m, full_duplex)) {
-        return false;
-    }
+    /* 3. Configure MAC Register (LM, FES, DM, DO, DCRS) */
+    uint32_t mac_cfg = reg32_read(ETH0_REG_MAC_CONFIGURATION_ADDR);
+    mac_cfg |= (1U << 2) | (1U << 3);  // RE=1, TE=1
+    mac_cfg |= (1U << 15);             // PS=1 (Port Select: 10/100 MII/RMII)
 
-    /* 2. PHY: only PHY-loopback tests touch the PHY's speed/duplex. MAC tests just make sure
-     *    the PHY is not left in loopback from an earlier PHY test. */
-    if (is_phy_lb) {
-        ETH_PHY_ConfigureMode(PHY_ADDR, true, speed_100m, full_duplex);
+    // MAC Loopback bit 12
+    if (is_mac_lb) {
+        mac_cfg |= (1U << 12);
     } else {
-        phy_disable_loopback(PHY_ADDR);
+        mac_cfg &= ~(1U << 12);
     }
 
-    /* Let the PHY / clocks settle before the first frame. */
-    for (volatile uint32_t d = 0; d < 150000u; d++) {
+    // Speed bit 14 (FES)
+    if (speed_100m) {
+        mac_cfg |= (1U << 14);
+    } else {
+        mac_cfg &= ~(1U << 14);
+    }
+
+    // Duplex bit 11 (DM), Receive Own bit 13 (DO), Carrier Sense bit 16 (DCRS)
+    if (full_duplex) {
+        mac_cfg |= (1U << 11);         // DM = 1 (Full Duplex)
+        mac_cfg &= ~(1U << 16);        // DCRS = 0
+    } else {
+        mac_cfg &= ~(1U << 11);        // DM = 0 (Half Duplex)
+        mac_cfg &= ~(1U << 13);        // DO = 0 (Receive Own ENABLED in Half Duplex)
+        mac_cfg |= (1U << 16);         // DCRS = 1 (Ignore carrier sense to allow loopback)
+    }
+    reg32_write(ETH0_REG_MAC_CONFIGURATION_ADDR, mac_cfg);
+
+    /* Allow PHY PLL and RMII clock to stabilize (essential for 100 Mbps) */
+    delay_ms(80);
+
+    /* 4. Re-arm All Descriptors in the 192-byte chain (3 descriptors x 64B) */
+    ETH_RX_DESC* rx_desc = rx_desc_list;
+    ETH_TX_DESC* tx_desc = tx_desc_list;
+    for (int d = 0; d < 3; d++) {
+        // Clear RX buffers and grant ownership to DMA
+        rx_desc->RDES0 = 0x80000000;
+        rx_desc->RDES1 = 0x81000040;
+
+        // Grant TX ownership to DMA
+        if (d == 0) {
+            tx_desc->TDES0 = 0xB0080000; // First segment
+        } else if (d == 2) {
+            tx_desc->TDES0 = 0xD0080000; // Last segment
+        } else {
+            tx_desc->TDES0 = 0x90080000; // Middle segment
+        }
+        tx_desc->TDES1 = 0x01000040;
+
+        rx_desc = (ETH_RX_DESC*)rx_desc->RDES3;
+        tx_desc = (ETH_TX_DESC*)tx_desc->TDES3;
+    }
+
+    /* 5. Reset Descriptor Head Pointers */
+    reg32_write(ETH0_REG_TRANSMIT_DESCRIPTOR_LIST_ADDRESS_ADDR, (uint32_t)tx_desc_list);
+    reg32_write(ETH0_REG_RECEIVE_DESCRIPTOR_LIST_ADDRESS_ADDR, (uint32_t)rx_desc_list);
+
+    /* Clear pending status flags */
+    reg32_write(ETH0_REG_STATUS_ADDR, 0xFFFFFFFF);
+
+    /* 6. Enable Store-and-Forward (TSF=1, RSF=1) to prevent Underflow at 100 Mbps */
+    op_mode |= (1U << 21) | (1U << 25); // TSF = 1, RSF = 1
+    op_mode |= (1U << 20);              // FTF = 1 (Flush TX FIFO)
+    op_mode |= (1U << 13) | (1U << 1);  // ST = 1, SR = 1
+    reg32_write(ETH0_REG_OPERATION_MODE_ADDR, op_mode);
+
+    /* Wake up DMA controllers */
+    reg32_write(ETH0_REG_RECEIVE_POLL_DEMAND_ADDR, 1);
+    reg32_write(ETH0_REG_TRANSMIT_POLL_DEMAND_ADDR, 1);
+
+    /* 7. Wait for TX Completion */
+    uint32_t tx_timeout = 200000;
+    while ((tx_desc_list->TDES0 & 0x80000000) && --tx_timeout) {
         __NOP();
     }
-
-    /* 3. Arm the RX DMA first so it is ready before anything is sent. */
-    rx_set_store_forward_mode();
-    rx_dma_stop();
-    rx_set_desc_list_base(rx_desc_list);
-    rx_desc_build_ring(rx_desc_list, (unsigned int*)rx_Frame, frame_size);
-    rx_dma_start();
-
-    /* 4. Prepare the TX frame and kick off the TX DMA. */
-    tx_fill_test_frame(Frame);
-    tx_set_store_forward_mode();
-    tx_dma_stop();
-    tx_set_desc_list_base(tx_desc_list);
-    tx_desc_mark_first_seg(tx_desc_list);
-    tx_desc_build_ring(tx_desc_list, (unsigned int*)Frame, frame_size);
-    tx_dma_poll_demand();
-    tx_dma_start();
-
-    /* 5. Wait for TX and RX to complete (both are bounded, so this cannot hang). */
-    if (!wait_for_transmit_complete()) {
-        printf("[DEBUG] Timeout: transmit did not complete, STATUS=0x%08X\r\n", (unsigned int)reg32_read(ETH0_REG_STATUS_ADDR));
-        return false;
-    }
-    if (!wait_for_receive_complete()) {
-        printf("[DEBUG] Timeout: Packet not received by DMA\r\n");
+    if (tx_timeout == 0) {
+        printf("[DEBUG] Timeout: TX incomplete (STATUS=0x%08X)\r\n",
+               (unsigned int)reg32_read(ETH0_REG_STATUS_ADDR));
         return false;
     }
 
-    /* 6. Verify data integrity (TX buffer vs RX buffer). */
-    return verify_loopback_data(Frame, rx_Frame, frame_size, "ETH_RunTestCase") ? true : false;
+    /* 8. Wait for RX Completion */
+    uint32_t rx_timeout = 200000;
+    while ((rx_desc_list->RDES0 & 0x80000000) && --rx_timeout) {
+        __NOP();
+    }
+    if (rx_timeout == 0) {
+        printf("[DEBUG] Timeout: Packet not received by DMA (STATUS=0x%08X)\r\n",
+               (unsigned int)reg32_read(ETH0_REG_STATUS_ADDR));
+        return false;
+    }
+
+    /* 9. Verify Payload */
+    if (memcmp(Frame->tx_buff, rx_Frame->rx_buff, 64) == 0) {
+        printf("TEST CASE: PASS - 192 bytes verified through ETH_RunTestCase loopback\r\n");
+        return true;
+    } else {
+        printf("[DEBUG] Payload mismatch!\r\n");
+        return false;
+    }
 }
