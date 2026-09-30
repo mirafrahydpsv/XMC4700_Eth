@@ -1,0 +1,10 @@
+void eth_power_on();
+void eth_power_off();
+void eth_clk_enable();
+void eth_clk_disable();
+unsigned int eth_clk_is_enabled();
+void eth_hold_in_reset();
+void eth_release_from_reset();
+unsigned int eth_is_in_reset();
+void eth_power_clock_init();
+void time_stamp_init();

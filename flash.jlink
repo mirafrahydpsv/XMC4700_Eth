@@ -1,0 +1,10 @@
+device XMC4700-2048
+si SWD
+speed 4000
+connect
+r
+h
+loadfile "C:\Hari\Ethernet\Ethernet_loopback_final\Release\xmc4700_Eth_loopback.hex"
+r
+g
+exit

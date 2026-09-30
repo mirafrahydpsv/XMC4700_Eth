@@ -1,0 +1,20 @@
+# Build output folders
+Release/
+Debug/
+
+# Compiler output files
+*.o
+*.o.lst
+*.d
+*.hex
+*.elf
+*.bin
+*.map
+*.lst
+
+# Eclipse / DAVE workspace & swap files
+.metadata/
+*.swp
+*~
+temp_workspace/
+temp_dave_ws/
